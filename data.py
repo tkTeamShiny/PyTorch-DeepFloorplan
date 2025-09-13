@@ -1,6 +1,6 @@
-# data.py —— 自動インデックス生成（柔軟トークン対応）＋ Albumentations/torchvision対応の最小パッチ込み
+# data.py —— 自動インデックス生成（柔軟トークン対応）＋ 変換適用の“順に試す”最小パッチ
 
-import os, re, glob, random, inspect
+import os, re, glob, random
 import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset
@@ -102,49 +102,40 @@ class MyRotationTransform:
                 _rotate_mask(room, a),
                 _rotate_mask(door, a))
 
-# ===== Albumentations/torchvision/自作Transform の自動切替（最小パッチ） =====
-def _is_albumentations_transform(transform):
-    """Albumentationsかどうかを厳密めに判定（モジュール名 or 署名）"""
-    mod = type(transform).__module__.lower()
-    if 'albumentations' in mod:
-        return True
-    # __call__ の署名に 'image' キーワード or **kwargs を持てば Albumentations 互換とみなす
-    try:
-        sig = inspect.signature(transform.__call__ if hasattr(transform, '__call__') else transform)
-        params = list(sig.parameters.values())
-        names = [p.name for p in params]
-        has_image_kw = 'image' in names
-        accepts_kwargs = any(p.kind == p.VAR_KEYWORD for p in params)
-        if has_image_kw or accepts_kwargs:
-            return True
-    except Exception:
-        pass
-    return False
-
+# ===== 変換の“順に試す”適用（最小パッチの要） =====
 def _apply_transform(transform, image, boundary, room, door):
-    """transform の型に応じて安全に適用する:
-       - Albumentations: transform(image=..., masks=[...])
-       - torchvision.Compose: 画像のみ（PIL/Tensor対応）※幾何学系は使わないでください
-       - 自作4引数Transform: transform(image, boundary, room, door)
-       - 1引数Transform: 画像のみ
+    """transform を安全に適用するために順に試す:
+       ① Albumentations 形式: transform(image=..., masks=[...])  -> dict返り値想定
+       ② torchvision / 単一引数: transform(PIL/array) -> 画像のみ
+       ③ 自作4引数: transform(image, boundary, room, door)
+       ④ それでもダメならそのまま返す
     """
     if transform is None:
         return image, boundary, room, door
 
-    # 1) Albumentations
-    if _is_albumentations_transform(transform):
-        boundary_i = boundary.astype(np.int32, copy=False)
-        room_i     = room.astype(np.int32, copy=False)
-        door_i     = door.astype(np.int32, copy=False)
-        out = transform(image=image, masks=[boundary_i, room_i, door_i])
-        img = out.get('image', image)
-        m1, m2, m3 = out.get('masks', [boundary_i, room_i, door_i])
-        return img, m1.astype(boundary.dtype, copy=False), m2.astype(room.dtype, copy=False), m3.astype(door.dtype, copy=False)
+    # ① Albumentations 形式を試す（kwargs対応）
+    try:
+        b_i = boundary.astype(np.int32, copy=False)
+        r_i = room.astype(np.int32, copy=False)
+        d_i = door.astype(np.int32, copy=False)
+        out = transform(image=image, masks=[b_i, r_i, d_i])
+        if isinstance(out, dict) and 'image' in out and 'masks' in out:
+            img = out['image']
+            m1, m2, m3 = out['masks']
+            return (img,
+                    m1.astype(boundary.dtype, copy=False),
+                    m2.astype(room.dtype, copy=False),
+                    m3.astype(door.dtype, copy=False))
+    except TypeError:
+        # キーワードを受け付けない＝Albumentationsではない
+        pass
+    except Exception:
+        # Albumentations と見なしても失敗するケースは次へ
+        pass
 
-    # 2) torchvision（モジュール名で判定）
-    mod = type(transform).__module__.lower()
-    if 'torchvision' in mod:
-        # 画像のみ適用（PIL/Tensor対応）。幾何学系を入れるとマスクとズレるので注意。
+    # ② torchvision / 単一引数（画像のみ変換）を試す
+    try:
+        # PIL 経由で最大互換
         pil = Image.fromarray(image.astype(np.uint8, copy=False)) if image.ndim == 3 else Image.fromarray(image.astype(np.uint8, copy=False))
         out = transform(pil)
         # Tensor or PIL -> np.ndarray(HWC)
@@ -162,26 +153,22 @@ def _apply_transform(transform, image, boundary, room, door):
         except Exception:
             img_np = np.array(out)
         return img_np, boundary, room, door
-
-    # 3) 自作（4引数想定） or 画像のみ
-    try:
-        sig = inspect.signature(transform.__call__ if hasattr(transform, '__call__') else transform)
-        n_params = len(sig.parameters)
+    except TypeError:
+        # torchvision ではない / imgのみの1引数ではない
+        pass
     except Exception:
-        n_params = None
+        pass
 
-    if n_params in (4, 5) or (n_params is None):
-        try:
-            return transform(image, boundary, room, door)
-        except TypeError:
-            pass  # フォールバック
-
+    # ③ 自作4引数 Transform を試す
     try:
-        img = transform(image)
-        return img, boundary, room, door
+        return transform(image, boundary, room, door)
+    except TypeError:
+        pass
     except Exception:
-        # 何も適用できなければそのまま返す
-        return image, boundary, room, door
+        pass
+
+    # ④ 何も適用できなければ素通し
+    return image, boundary, room, door
 
 # ===== インデックス生成 =====
 def _scan_and_build_index(root='dataset', out_path='dataset/r3d_index.csv'):
@@ -291,6 +278,6 @@ class r3dDataset(Dataset):
         room    = _imread_any(p_room, 'room',    self.size)
         door    = _imread_any(p_door, 'door',    self.size)
 
-        # ★ 最小パッチ：Albumentations / torchvision / 自作Transform の自動適用
+        # ★ 最小パッチ：変換を順に試して適用（Albumentations/torchvision/自作）
         image, boundary, room, door = _apply_transform(self.transform, image, boundary, room, door)
         return image, boundary, room, door
