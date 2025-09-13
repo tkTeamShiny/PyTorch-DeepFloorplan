@@ -27,25 +27,19 @@ class r3dDataset(Dataset):
     def _getset(self,idx): 
         target = self.df if idx < self.df.shape[0] else self.df2
         idx = idx if idx < self.df.shape[0] else idx-self.df.shape[0]
-        image = np.fromstring(target.loc[idx]['image'][1:-1],
-                dtype=np.uint8,sep=', ').reshape(self.size,self.size,3)
-        boundary = np.fromstring(target.loc[idx]['boundary'][1:-1],
-                dtype=np.uint8,sep=', ').reshape(self.size,self.size)
-        room = np.fromstring(target.loc[idx]['room'][1:-1],
-                dtype=np.uint8,sep=', ').reshape(self.size,self.size)
-        door = np.fromstring(target.loc[idx]['door'][1:-1],
-                dtype=np.uint8,sep=', ').reshape(self.size,self.size)
+        image  = _read_csv_image_strict(image_csv_path,   self.size)
+        boundary = _read_csv_image_strict(boundary_csv_path, self.size)
+        room     = _read_csv_image_strict(room_csv_path,     self.size)
+        door     = _read_csv_image_strict(door_csv_path,     self.size)
         return image,boundary,room,door
     def __getitem__(self,idx):
         image,boundary,room,door = self._getset(idx)
         #image,boundary,room,door = self.rotation(image,boundary,room,door)
         if self.transform:
-            image = self.transform(image.astype(np.float32)/255.0)
-            boundary = self.transform(F.one_hot(
-                torch.LongTensor(boundary),3).numpy())
-            room = self.transform(F.one_hot(
-                torch.LongTensor(room),9).numpy())
-            door = self.transform(door)
+            image  = _read_csv_image_strict(image_csv_path,   self.size)
+            boundary = _read_csv_image_strict(boundary_csv_path, self.size)
+            room     = _read_csv_image_strict(room_csv_path,     self.size)
+            door     = _read_csv_image_strict(door_csv_path,     self.size)
         return image,boundary,room,door
 
 if __name__ == "__main__":
