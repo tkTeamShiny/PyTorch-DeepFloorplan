@@ -1,4 +1,6 @@
-import os, re, glob, random
+# data.py —— 自動インデックス生成（柔軟トークン対応）＋ Albumentations対応の最小パッチ込み
+
+import os, re, glob, random, inspect
 import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset
@@ -75,9 +77,10 @@ def _imread_any(path: str, role: str, size: int):
             img = cv2.resize(img, (size, size), interpolation=cv2.INTER_LINEAR)
         else:
             img = cv2.resize(img, (size, size), interpolation=cv2.INTER_NEAREST)
-    # マスクを3chで読んでしまった場合は 1chに落とす（パレット前提の色は保持できない点に注意）
+    # マスクを3chで読んでしまった場合は 1chに落とす（簡便）
     if role != 'image' and img.ndim == 3 and img.shape[2] == 3:
-        img = cv2.cvtColor(img[:, :, ::-1], cv2.COLOR_BGR2GRAY)  # RGB->GRAY（簡便）
+        # 既に RGB にしているため COLOR_RGB2GRAY を用いる
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
     return img
 
 def _rotate_img(x, angle):
@@ -97,6 +100,51 @@ class MyRotationTransform:
                 _rotate_mask(boundary, a),
                 _rotate_mask(room, a),
                 _rotate_mask(door, a))
+
+# ===== Albumentations/自作Transform の自動切替（最小パッチ） =====
+def _apply_transform(transform, image, boundary, room, door):
+    """transform の型に応じて安全に適用する:
+       - Albumentations.Compose: transform(image=..., masks=[...])
+       - 自作4引数Transform: transform(image, boundary, room, door)
+       - 1引数Transform: image だけ変換（マスクはそのまま）
+    """
+    if transform is None:
+        return image, boundary, room, door
+
+    mod = type(transform).__module__.lower()
+    name = type(transform).__name__.lower()
+
+    # Albumentations（Compose 等）
+    if 'albumentations' in mod or name == 'compose':
+        boundary_i = boundary.astype(np.int32, copy=False)
+        room_i     = room.astype(np.int32, copy=False)
+        door_i     = door.astype(np.int32, copy=False)
+        out = transform(image=image, masks=[boundary_i, room_i, door_i])
+        img = out['image']
+        m1, m2, m3 = out['masks']
+        return img, m1.astype(boundary.dtype, copy=False), m2.astype(room.dtype, copy=False), m3.astype(door.dtype, copy=False)
+
+    # その他（シグネチャ確認）
+    try:
+        sig = inspect.signature(transform.__call__ if hasattr(transform, '__call__') else transform)
+        n_params = len(sig.parameters)
+    except Exception:
+        n_params = None
+
+    # 4引数（自作の回転 Transform 等）
+    if n_params in (4, 5) or (n_params is None):
+        try:
+            return transform(image, boundary, room, door)
+        except TypeError:
+            pass  # フォールバックへ
+
+    # 1引数（画像のみ変換）
+    try:
+        img = transform(image)
+        return img, boundary, room, door
+    except Exception:
+        # 最終フォールバック：何もしない
+        return image, boundary, room, door
 
 # ===== インデックス生成 =====
 def _scan_and_build_index(root='dataset', out_path='dataset/r3d_index.csv'):
@@ -119,12 +167,11 @@ def _scan_and_build_index(root='dataset', out_path='dataset/r3d_index.csv'):
         key = (d, basekey)
         if key not in buckets:
             buckets[key] = {}
-        # 既に同役割があれば、より“役割トークンに近い方”を優先
+        # 既に同役割があれば、より“役割トークンに近い方/CSV優先”を採用
         prev = buckets[key].get(role)
         if prev is None:
             buckets[key][role] = p
         else:
-            # ヒューリスティック：拡張子は CSV > PNG > JPG を優先
             prio = {'.csv': 3, '.png': 2, '.jpg': 1, '.jpeg': 1}
             e_new = os.path.splitext(p)[1].lower()
             e_old = os.path.splitext(prev)[1].lower()
@@ -207,6 +254,6 @@ class r3dDataset(Dataset):
         room    = _imread_any(p_room, 'room',    self.size)
         door    = _imread_any(p_door, 'door',    self.size)
 
-        if self.transform is not None:
-            image, boundary, room, door = self.transform(image, boundary, room, door)
+        # ★ 最小パッチ：Albumentations/自作Transform の自動適用
+        image, boundary, room, door = _apply_transform(self.transform, image, boundary, room, door)
         return image, boundary, room, door
