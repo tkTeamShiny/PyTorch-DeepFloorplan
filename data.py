@@ -1,14 +1,18 @@
-from importmod import *
-import os, random, gc
+# data.py ーーー ドロップイン置換用（自動 index 生成つき）
+
+import os, glob, random
 import numpy as np
 import pandas as pd
+from torch.utils.data import Dataset
 from skimage.transform import rotate
-from torch.utils.data import Dataset, DataLoader
 
-# ---------- CSV読み取り（チャンネル自動判定：1ch or 3ch） ----------
+# ---------- ユーティリティ ----------
 def _read_csv_auto(path: str, size: int):
+    """1ch/3ch を自動判定して ndarray を返す"""
     exp3 = size * size * 3
     exp1 = size * size
+    if not isinstance(path, str):
+        raise TypeError(f'[Index error] path cell must be str, got {type(path)}: {path!r}')
     if not os.path.exists(path):
         raise FileNotFoundError(f'[CSV missing] {path}')
     try:
@@ -22,101 +26,140 @@ def _read_csv_auto(path: str, size: int):
         return arr.reshape(size, size)
     raise ValueError(f'[CSV size mismatch] {path} -> {arr.size} (expected {exp3} or {exp1})')
 
-# ---------- 行からパス列を安全に取得 ----------
-def _pick(row: pd.Series, candidates):
-    for c in candidates:
-        if c in row and isinstance(row[c], str) and row[c].strip():
-            return row[c].strip()
-    raise KeyError(f'Missing required columns. Tried: {candidates} in row keys={list(row.index)}')
-
-# ---------- 画像は双一次, マスクは最近傍で回転 ----------
 def _rotate_img(x, angle):
-    return rotate(x, angle, preserve_range=True, order=1, mode='edge').astype(x.dtype)
+    # 画像は双一次補間
+    y = rotate(x, angle, preserve_range=True, order=1, mode='edge')
+    return y.astype(x.dtype)
 
 def _rotate_mask(x, angle):
-    # マスク（整数ラベル）を壊さない
+    # マスクは最近傍（整数ラベル破壊しない）
     y = rotate(x, angle, preserve_range=True, order=0, mode='edge')
     return np.rint(y).astype(x.dtype)
 
+def _is_index_df(df: pd.DataFrame):
+    """index CSV として妥当か簡易チェック"""
+    need_cols = {'image_csv','boundary_csv','room_csv','door_csv'}
+    if not need_cols.issubset(set(c.lower() for c in df.columns)):
+        return False
+    # 先頭行に .csv を含む文字列があるか
+    row = df.iloc[0]
+    keys = ['image_csv','boundary_csv','room_csv','door_csv']
+    for k in keys:
+        k0 = next(c for c in df.columns if c.lower()==k)
+        v = row[k0]
+        if not (isinstance(v, str) and v.strip().endswith('.csv')):
+            return False
+    return True
+
+def _build_index_csv(root='dataset', out_path='dataset/r3d_index.csv'):
+    """
+    例：
+      ./dataset/newyork/train/21.csv
+      ./dataset/newyork/train/21_wall.csv
+      ./dataset/newyork/train/21_rooms.csv
+      ./dataset/newyork/train/21_close.csv
+    をペアにして index CSV を作る
+    """
+    # ベース画像候補（*_wall/_rooms/_close を除く）
+    all_csv = glob.glob(os.path.join(root, '**', '*.csv'), recursive=True)
+    def is_base(p):
+        b = os.path.basename(p)
+        lb = b.lower()
+        return (not lb.endswith('_wall.csv')
+                and not lb.endswith('_rooms.csv')
+                and not lb.endswith('_close.csv'))
+    bases = [p for p in all_csv if is_base(p)]
+    rows = []
+    miss = 0
+    for img in sorted(bases):
+        base = img[:-4]  # drop .csv
+        wall = base + '_wall.csv'
+        rooms = base + '_rooms.csv'
+        close = base + '_close.csv'
+        ok = True
+        for q in (wall, rooms, close):
+            if not os.path.exists(q):
+                ok = False
+                break
+        if ok:
+            rows.append({
+                'image_csv': img,
+                'boundary_csv': wall,
+                'room_csv': rooms,
+                'door_csv': close,
+            })
+        else:
+            miss += 1
+    if not rows:
+        raise RuntimeError(f'[Index build] No pairs found under ./{root}. '
+                           f'画像/マスクの命名（*_wall/_rooms/_close）と配置を確認してください。')
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    pd.DataFrame(rows).to_csv(out_path, index=False)
+    return out_path, len(rows), miss
+
+# ---------- 回転 Transform ----------
 class MyRotationTransform:
     def __init__(self, angles=(0, 90, -90, 180)):
         self.angles = angles
     def __call__(self, image, boundary, room, door):
         a = random.choice(self.angles)
-        image_r = _rotate_img(image, a)
-        boundary_r = _rotate_mask(boundary, a)
-        room_r = _rotate_mask(room, a)
-        door_r = _rotate_mask(door, a)
-        return image_r, boundary_r, room_r, door_r
+        return (_rotate_img(image, a),
+                _rotate_mask(boundary, a),
+                _rotate_mask(room, a),
+                _rotate_mask(door, a))
 
+# ---------- データセット本体 ----------
 class r3dDataset(Dataset):
     """
-    r3d.csv / r3d2.csv は、以下いずれかの列名で各CSVへのパスを持っている前提：
-      - 画像:  ['image_csv','image','img_csv','img']
-      - 壁境界: ['boundary_csv','wall_csv','boundary','wall']
-      - 部屋  : ['room_csv','rooms_csv','room','rooms']
-      - ドア  : ['door_csv','close_csv','door','close']
-    パスは相対でも絶対でもOK（存在チェックあり）
+    使い方：
+      - 既に dataset/r3d_index.csv があればそのまま使用（列: image_csv,boundary_csv,room_csv,door_csv）
+      - 無ければ ./dataset 以下を走査して自動生成（*_wall/_rooms/_close をペアリング）
     """
-    IMG_KEYS  = ['image_csv','image','img_csv','img']
-    WALL_KEYS = ['boundary_csv','wall_csv','boundary','wall','cw_csv','cw']
-    ROOM_KEYS = ['room_csv','rooms_csv','room','rooms','r_csv','r']
-    DOOR_KEYS = ['door_csv','close_csv','door','close','d_csv','d']
-
-    def __init__(self, csv_file='r3d.csv', size=512, transform=None, csv_file2='r3d2.csv'):
+    def __init__(self, index_csv='dataset/r3d_index.csv', size=512, transform=None):
         self.size = int(size)
-        self.df  = pd.read_csv(csv_file)
-        self.df2 = pd.read_csv(csv_file2) if os.path.exists(csv_file2) else pd.DataFrame(columns=self.df.columns)
         self.transform = transform  # 例: MyRotationTransform()
-        # 早期に列存在チェック
-        if self.df.empty and self.df2.empty:
-            raise RuntimeError('Both r3d.csv and r3d2.csv are empty.')
-        # optional: 先頭行で列名ヒントを表示
-        sample = (self.df if not self.df.empty else self.df2).iloc[0]
-        _ = (_pick(sample, self.IMG_KEYS), _pick(sample, self.WALL_KEYS),
-             _pick(sample, self.ROOM_KEYS), _pick(sample, self.DOOR_KEYS))
+
+        # index 読み込み or 自動生成
+        need_build = (not os.path.exists(index_csv))
+        if not need_build:
+            df = pd.read_csv(index_csv)
+            if not len(df):
+                need_build = True
+            elif not _is_index_df(df):
+                need_build = True
+
+        if need_build:
+            print(f'[data.py] building index -> {index_csv}')
+            index_csv, n_ok, n_miss = _build_index_csv(root='dataset', out_path=index_csv)
+            print(f'[data.py] index built: {n_ok} pairs (skipped {n_miss})')
+
+        self.df = pd.read_csv(index_csv)
+        # 列名 normalize
+        cols = {c.lower(): c for c in self.df.columns}
+        self.k_img  = cols.get('image_csv')
+        self.k_wall = cols.get('boundary_csv')
+        self.k_room = cols.get('room_csv')
+        self.k_door = cols.get('door_csv')
+        for k in [self.k_img, self.k_wall, self.k_room, self.k_door]:
+            if k is None:
+                raise KeyError(f'[index csv] columns must include image_csv,boundary_csv,room_csv,door_csv; got {self.df.columns.tolist()}')
 
     def __len__(self):
-        return len(self.df) + len(self.df2)
-
-    def _row(self, idx):
-        if idx < len(self.df):
-            return self.df.iloc[idx]
-        return self.df2.iloc[idx - len(self.df)]
+        return len(self.df)
 
     def _get_paths(self, idx):
-        row = self._row(idx)
-        image_csv_path   = _pick(row, self.IMG_KEYS)
-        boundary_csv_path= _pick(row, self.WALL_KEYS)
-        room_csv_path    = _pick(row, self.ROOM_KEYS)
-        door_csv_path    = _pick(row, self.DOOR_KEYS)
-        return image_csv_path, boundary_csv_path, room_csv_path, door_csv_path
-
-    def _getset(self, idx):
-        image_csv_path, boundary_csv_path, room_csv_path, door_csv_path = self._get_paths(idx)
-        image   = _read_csv_auto(image_csv_path,   self.size)
-        boundary= _read_csv_auto(boundary_csv_path, self.size)
-        room    = _read_csv_auto(room_csv_path,     self.size)
-        door    = _read_csv_auto(door_csv_path,     self.size)
-        return image, boundary, room, door
+        row = self.df.iloc[idx]
+        return (str(row[self.k_img]).strip(),
+                str(row[self.k_wall]).strip(),
+                str(row[self.k_room]).strip(),
+                str(row[self.k_door]).strip())
 
     def __getitem__(self, idx):
-        image, boundary, room, door = self._getset(idx)
+        p_img, p_wall, p_room, p_door = self._get_paths(idx)
+        image   = _read_csv_auto(p_img,   self.size)
+        boundary= _read_csv_auto(p_wall,  self.size)
+        room    = _read_csv_auto(p_room,  self.size)
+        door    = _read_csv_auto(p_door,  self.size)
         if self.transform is not None:
             image, boundary, room, door = self.transform(image, boundary, room, door)
-        # そのまま numpy を返す（元 main.py が内部でテンソル化する前提）
         return image, boundary, room, door
-
-# ===== 単体テスト =====
-if __name__ == "__main__":
-    import matplotlib.pyplot as plt
-    ds = r3dDataset(csv_file='r3d.csv', csv_file2='r3d2.csv',
-                    size=512, transform=MyRotationTransform())
-    img, wall, room, door = ds[min(200, len(ds)-1)]
-    plt.subplot(2,2,1); plt.title('image'); plt.imshow(img if img.ndim==3 else img, cmap=None)
-    plt.subplot(2,2,2); plt.title('boundary'); plt.imshow(wall, cmap='gray')
-    plt.subplot(2,2,3); plt.title('room'); plt.imshow(room, cmap='gray')
-    plt.subplot(2,2,4); plt.title('door'); plt.imshow(door, cmap='gray')
-    plt.tight_layout(); plt.show()
-    breakpoint()
-    gc.collect()
