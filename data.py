@@ -153,7 +153,7 @@ def _scan_and_build_index(root='dataset', out_path='dataset/r3d_index.csv'):
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     pd.DataFrame(rows).to_csv(out_path, index=False)
-    return out_path, len(rows), len(skipped))
+    return out_path, len(rows), len(skipped)
 
 def _is_valid_index(df: pd.DataFrame):
     need = {'image_csv','boundary_csv','room_csv','door_csv'}
