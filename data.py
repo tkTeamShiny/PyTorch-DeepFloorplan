@@ -4,6 +4,8 @@ import random
 from skimage.transform import rotate
 from torch.utils.data import Dataset, DataLoader
 
+import numpy as np, os
+
 class MyRotationTransform:
     def __init__(self,angles=[0,90,-90.180]):
         self.angles = angles
@@ -61,4 +63,20 @@ if __name__ == "__main__":
     breakpoint()
     
     gc.collect()
+
+def _read_csv_image_strict(path: str, size: int):
+    exp = size * size * 3
+    if not os.path.exists(path):
+        raise FileNotFoundError(f'[CSV missing] {path}')
+    # まずはカンマ区切りで読む（スペース有無は吸収される）
+    try:
+        arr = np.loadtxt(path, dtype=np.uint8, delimiter=',')
+    except Exception as e:
+        # フォールバック：genfromtxt
+        arr = np.genfromtxt(path, dtype=np.uint8, delimiter=',')
+    # 1次元想定（flattenで保存されている前提）
+    arr = np.asarray(arr).reshape(-1,)
+    if arr.size != exp:
+        raise ValueError(f'[CSV size mismatch] {path} -> {arr.size} (expected {exp})')
+    return arr.reshape(size, size, 3)
 
