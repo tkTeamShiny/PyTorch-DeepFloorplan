@@ -78,7 +78,7 @@ def main(args):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument('--loadmodel',type=str,default="log/store2/checkpoint.pt")
+    p.add_argument('--loadmodel',type=str,default="/content/PyTorch-DeepFloorplan/checkpoints/best.pth")
     p.add_argument('--postprocess',type=bool,default=False)
     p.add_argument('--image_path',type=str,default="/media/yui/Disk/data/deepfloorplan/dataset/newyork/test/47545145.jpg")
     args = p.parse_args()
