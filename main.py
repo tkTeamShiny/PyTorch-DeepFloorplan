@@ -1,9 +1,17 @@
 # ============================================
 # main.py — PyTorch-DeepFloorplan
-#   newyork/{train,test} + r3d_{train,test}.txt 構成に対応
-#   画像・マスクを Dataset 内で共通サイズにリサイズ（既定 512x512）
-#   Conv2dへuint8が入って落ちる問題は、model(im)直前の prepare_inputs() で根絶
-#   AMP は torch.amp.* の新APIに更新
+#   対応構成:
+#     ./dataset/newyork/
+#       ├── train/  … <ID>.jpg|png, <ID>_rooms.png, <ID>_wall.png
+#       ├── test/   … 同上
+#       ├── r3d_train.txt   （任意・優先利用）
+#       └── r3d_test.txt    （任意・優先利用）
+#   仕様:
+#     - r3d_*.txt があれば分割に優先使用（無ければ 80/20）。
+#     - 画像/マスクは Dataset 内で共通サイズにリサイズ（既定 512x512）。
+#     - Conv2d に uint8 が入って落ちる問題は model(im) 直前の prepare_inputs() で根絶。
+#     - AMP は torch のバージョン差を吸収（cuda なら autocast+GradScaler、CPU/非AMPは通常実行）。
+#     - VGG16 の weights は net.py 側で torchvision 新API (VGG16_Weights.DEFAULT) を使用。
 # ============================================
 
 import os
@@ -81,8 +89,8 @@ def _scan_triplets(bases: List[Path], rooms_suffix: str, wall_suffix: str) -> Di
         for p in base.rglob("*"):
             if p.is_file() and p.suffix.lower() in IMG_EXTS:
                 stem = p.stem
-                # .jpg を優先
                 prev = img_by_stem.get(stem)
+                # .jpg を優先
                 if prev is None or (prev.suffix.lower() != ".jpg" and p.suffix.lower() == ".jpg"):
                     img_by_stem[stem] = p
 
@@ -122,7 +130,7 @@ class NYRoomWallDataset(Dataset):
       画像: <ID>.jpg|png
       部屋: <ID>_rooms.png  （rooms_suffix）
       壁:   <ID>_wall.png   （wall_suffix）
-    __getitem__ 内で (W,H) = (input_size, input_size) に**リサイズ**します。
+    __getitem__ 内で (W,H) = (input_size, input_size) に**リサイズ**。
     返却タプル: (im, cw, r, meta)  ※cw=wall, r=rooms（元コード互換）
     """
     def __init__(self, data_root: Path, split: str,
@@ -294,10 +302,10 @@ def train_one_epoch(model, loader, optimizer, scaler, device, args):
         r  = r.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        if args.amp:
-            from torch.amp import autocast
-            dtype = torch.float16 if device.type == "cuda" else torch.bfloat16
-            with autocast(device_type=device.type, dtype=dtype):
+        if args.amp and device.type == "cuda":
+            # 互換性の高い autocast（cuda 環境のみ）
+            from torch.cuda.amp import autocast
+            with autocast(dtype=torch.float16):
                 logits_r, logits_cw = model(im)
                 loss, parts = compute_losses(logits_r, logits_cw, r, cw, args.w_r, args.w_cw)
             scaler.scale(loss).backward()
@@ -332,7 +340,13 @@ def validate(model, loader, device, args):
         cw = cw.to(device, non_blocking=True)
         r  = r.to(device, non_blocking=True)
 
-        logits_r, logits_cw = model(im)
+        if args.amp and device.type == "cuda":
+            from torch.cuda.amp import autocast
+            with autocast(dtype=torch.float16):
+                logits_r, logits_cw = model(im)
+        else:
+            logits_r, logits_cw = model(im)
+
         loss, parts = compute_losses(logits_r, logits_cw, r, cw, args.w_r, args.w_cw)
 
         bs = im.size(0)
@@ -474,8 +488,19 @@ def main(args):
         except Exception:
             pass
 
-    # AMP（新API）
-    scaler = torch.amp.GradScaler(device_type=device.type, enabled=args.amp)
+    # AMP（バージョン互換の GradScaler 準備）
+    if args.amp and device.type == "cuda":
+        try:
+            from torch.amp import GradScaler  # 新APIがあれば使用
+            scaler = GradScaler(enabled=True)
+        except Exception:
+            scaler = torch.cuda.amp.GradScaler(enabled=True)  # 旧APIにフォールバック
+    else:
+        class _NoScaler:
+            def scale(self, x): return x
+            def step(self, opt): opt.step()
+            def update(self): pass
+        scaler = _NoScaler()
 
     # Train
     best_val = float("inf")
