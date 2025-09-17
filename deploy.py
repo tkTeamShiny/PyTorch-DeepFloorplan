@@ -1,9 +1,10 @@
 # ============================================
-# deploy.py — PyTorch-DeepFloorplan (inference)
-# - 学習チェックポイント(best.pth等)と生のstate_dictの両方に対応
+# deploy.py — PyTorch-DeepFloorplan (inference, Colab-friendly)
+# - 学習チェックポイント(best.pth等) / 純state_dict の両方に対応
 # - main.py と同じ前処理（float化→3ch→ImageNet正規化）
-# - 画像は --image_path 未指定でも search_root から自動選択
-# - 後処理(postprocess)は従来の util/ をそのまま利用
+# - 画像は --image_path 未指定でも --search_root から自動選択
+# - Colab で !python 実行でも見られるよう PNG を保存（--out_dir）
+# - 必要に応じて --show で plt.show() も可能（ノートブック直実行向け）
 # ============================================
 
 import os
@@ -16,7 +17,12 @@ from typing import Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+
+# ---- Matplotlib は保存用バックエンドに ----
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
 import cv2
 
 # utils
@@ -45,7 +51,6 @@ def prepare_inputs(im: torch.Tensor) -> torch.Tensor:
         im = im.float().div_(255.0)
     if im.dim() == 4 and im.size(1) == 1:
         im = im.repeat(1, 3, 1, 1)
-    # 手動正規化（torchvision未依存）
     mean = torch.tensor(IMAGENET_MEAN, dtype=im.dtype, device=im.device).view(1,3,1,1)
     std  = torch.tensor(IMAGENET_STD,  dtype=im.dtype, device=im.device).view(1,3,1,1)
     im = (im - mean) / std
@@ -55,18 +60,15 @@ def prepare_inputs(im: torch.Tensor) -> torch.Tensor:
 # -------------------------
 # ログits → (H,W) 予測ID
 # -------------------------
-def BCHW2colormap(tensor: torch.Tensor, earlyexit=False):
+def BCHW2argmax(tensor: torch.Tensor) -> np.ndarray:
     """
     tensor: (B,C,H,W) ログits
     return: (H,W) のクラスID（argmax）
     """
     if tensor.size(0) != 1:
         tensor = tensor[0].unsqueeze(0)
-    result = tensor.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()  # (H,W,C)
-    if earlyexit:
-        return result
-    result = np.argmax(result, axis=2)  # (H,W)
-    return result
+    arr = tensor.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()  # (H,W,C)
+    return np.argmax(arr, axis=2)  # (H,W)
 
 
 # -------------------------
@@ -82,8 +84,7 @@ def _load_state_dict_flex(path: str, device: torch.device):
             return ckpt["state_dict"]
         if "model" in ckpt and isinstance(ckpt["model"], dict):
             return ckpt["model"]
-    # 純 state_dict とみなす
-    return ckpt
+    return ckpt  # 純 state_dict とみなす
 
 
 # -------------------------
@@ -168,6 +169,43 @@ def post_process(rm_ind: np.ndarray, bd_ind: np.ndarray) -> np.ndarray:
 
 
 # -------------------------
+# 可視化の保存（Colab対応）
+# -------------------------
+def save_visualizations(orig_rgb: np.ndarray,
+                        pred_rooms_ind: np.ndarray,
+                        pred_boundary_ind: np.ndarray,
+                        out_dir: Path,
+                        stem: str):
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Rooms を RGB に着色
+    rooms_rgb = ind2rgb(pred_rooms_ind, color_map=floorplan_fuse_map)  # (H,W,3) uint8
+
+    # Triptych 図を保存
+    plt.figure(figsize=(12, 4))
+    plt.subplot(1, 3, 1); plt.title("Input");    plt.imshow(orig_rgb);          plt.axis("off")
+    plt.subplot(1, 3, 2); plt.title("Rooms");    plt.imshow(rooms_rgb);         plt.axis("off")
+    plt.subplot(1, 3, 3); plt.title("Boundary"); plt.imshow(pred_boundary_ind); plt.axis("off")
+    plt.tight_layout()
+    trip_path = out_dir / f"{stem}_triptych.png"
+    plt.savefig(trip_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+    # 単体画像も保存（OpenCV は BGR なので変換）
+    cv2.imwrite(str(out_dir / f"{stem}_input.jpg"),
+                cv2.cvtColor(orig_rgb, cv2.COLOR_RGB2BGR))
+    cv2.imwrite(str(out_dir / f"{stem}_rooms_rgb.png"),
+                cv2.cvtColor(rooms_rgb, cv2.COLOR_RGB2BGR))
+    # Boundary はインデックス（モノクロ）
+    norm_boundary = (pred_boundary_ind.astype(np.uint8) * (255 // max(1, pred_boundary_ind.max())))
+    cv2.imwrite(str(out_dir / f"{stem}_boundary.png"), norm_boundary)
+
+    print(f"[save] {trip_path}")
+    print(f"[save] {out_dir / f'{stem}_rooms_rgb.png'}")
+    print(f"[save] {out_dir / f'{stem}_boundary.png'}")
+
+
+# -------------------------
 # メイン
 # -------------------------
 def main(args):
@@ -176,21 +214,26 @@ def main(args):
 
     with torch.no_grad():
         logits_r, logits_cw = model(image_t)          # (1,Cr,H,W), (1,Cw,H,W)
-        predroom = BCHW2colormap(logits_r)            # (H,W)
-        predboundary = BCHW2colormap(logits_cw)       # (H,W)
+        predroom = BCHW2argmax(logits_r)              # (H,W)
+        predboundary = BCHW2argmax(logits_cw)         # (H,W)
 
     if args.postprocess:
         predroom = post_process(predroom, predboundary)
 
-    rgb_vis = ind2rgb(predroom, color_map=floorplan_fuse_map)
+    stem = Path(used_path).stem
+    out_dir = Path(args.out_dir)
+    save_visualizations(orig_rgb, predroom, predboundary, out_dir, stem)
 
-    # 可視化
-    plt.figure(figsize=(12, 4))
-    plt.subplot(1, 3, 1); plt.title("Input"); plt.imshow(orig_rgb); plt.axis("off")
-    plt.subplot(1, 3, 2); plt.title("Rooms"); plt.imshow(rgb_vis); plt.axis("off")
-    plt.subplot(1, 3, 3); plt.title("Boundary"); plt.imshow(predboundary := predboundary); plt.axis("off")
-    plt.tight_layout()
-    plt.show()
+    # （ノートブックの Python 実行時のみ）希望があれば表示
+    if args.show:
+        # この show は「ノートブック内から import して呼ぶ」場合に有効
+        img_path = out_dir / f"{stem}_triptych.png"
+        try:
+            from IPython.display import Image, display
+            display(Image(filename=str(img_path)))
+        except Exception:
+            # 環境に IPython が無い場合は無視
+            pass
 
 
 # -------------------------
@@ -206,6 +249,10 @@ if __name__ == "__main__":
                    help="--image_path 未指定時に画像を探すルートディレクトリ")
     p.add_argument("--postprocess", action="store_true",
                    help="後処理を有効化 (fill/flood/refine)")
+    p.add_argument("--out_dir", type=str, default="./vis",
+                   help="可視化の保存先ディレクトリ")
+    p.add_argument("--show", action="store_true",
+                   help="ノートブックから import 実行した場合に inline 表示する")
 
     args = p.parse_args()
     main(args)
