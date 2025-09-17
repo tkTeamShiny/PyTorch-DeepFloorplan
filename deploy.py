@@ -4,19 +4,17 @@
 # - main.py と同じ前処理（float化→3ch→ImageNet正規化）
 # - 画像は --image_path 未指定でも --search_root から自動選択
 # - Colab で !python 実行でも見られるよう PNG を保存（--out_dir）
-# - 必要に応じて --show で plt.show() も可能（ノートブック直実行向け）
+# - 保存時に画像dtypeをuint8へ正規化（OpenCV対応）
 # ============================================
 
 import os
 import sys
-import glob
 import argparse
 from pathlib import Path
 from typing import Tuple
 
 import numpy as np
 import torch
-import torch.nn as nn
 
 # ---- Matplotlib は保存用バックエンドに ----
 import matplotlib
@@ -169,6 +167,24 @@ def post_process(rm_ind: np.ndarray, bd_ind: np.ndarray) -> np.ndarray:
 
 
 # -------------------------
+# OpenCV 保存のための dtype 正規化
+# -------------------------
+def to_uint8(arr: np.ndarray) -> np.ndarray:
+    """OpenCV が扱えるように uint8 へ変換"""
+    if arr.dtype == np.uint8:
+        return arr
+    if np.issubdtype(arr.dtype, np.floating):
+        m = float(np.nanmax(arr)) if arr.size else 0.0
+        if m <= 1.0 + 1e-6:  # 0..1 を想定
+            arr = np.clip(arr, 0.0, 1.0) * 255.0
+        else:
+            arr = np.clip(arr, 0.0, 255.0)
+        return arr.round().astype(np.uint8)
+    # 整数系（int32等）は 0..255 にクリップして uint8 化
+    return np.clip(arr, 0, 255).astype(np.uint8)
+
+
+# -------------------------
 # 可視化の保存（Colab対応）
 # -------------------------
 def save_visualizations(orig_rgb: np.ndarray,
@@ -178,10 +194,11 @@ def save_visualizations(orig_rgb: np.ndarray,
                         stem: str):
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Rooms を RGB に着色
-    rooms_rgb = ind2rgb(pred_rooms_ind, color_map=floorplan_fuse_map)  # (H,W,3) uint8
+    # Rooms を RGB に着色（→ uint8 化）
+    rooms_rgb = ind2rgb(pred_rooms_ind, color_map=floorplan_fuse_map)
+    rooms_rgb = to_uint8(rooms_rgb)
 
-    # Triptych 図を保存
+    # Triptych 図を保存（matplotlib）
     plt.figure(figsize=(12, 4))
     plt.subplot(1, 3, 1); plt.title("Input");    plt.imshow(orig_rgb);          plt.axis("off")
     plt.subplot(1, 3, 2); plt.title("Rooms");    plt.imshow(rooms_rgb);         plt.axis("off")
@@ -193,12 +210,15 @@ def save_visualizations(orig_rgb: np.ndarray,
 
     # 単体画像も保存（OpenCV は BGR なので変換）
     cv2.imwrite(str(out_dir / f"{stem}_input.jpg"),
-                cv2.cvtColor(orig_rgb, cv2.COLOR_RGB2BGR))
+                cv2.cvtColor(to_uint8(orig_rgb), cv2.COLOR_RGB2BGR))
     cv2.imwrite(str(out_dir / f"{stem}_rooms_rgb.png"),
                 cv2.cvtColor(rooms_rgb, cv2.COLOR_RGB2BGR))
     # Boundary はインデックス（モノクロ）
-    norm_boundary = (pred_boundary_ind.astype(np.uint8) * (255 // max(1, pred_boundary_ind.max())))
-    cv2.imwrite(str(out_dir / f"{stem}_boundary.png"), norm_boundary)
+    maxv = int(pred_boundary_ind.max()) if pred_boundary_ind.size else 0
+    scale = 255 // max(1, maxv)
+    norm_boundary = (pred_boundary_ind.astype(np.int32) * scale)
+    cv2.imwrite(str(out_dir / f"{stem}_boundary.png"),
+                to_uint8(norm_boundary))
 
     print(f"[save] {trip_path}")
     print(f"[save] {out_dir / f'{stem}_rooms_rgb.png'}")
@@ -226,13 +246,11 @@ def main(args):
 
     # （ノートブックの Python 実行時のみ）希望があれば表示
     if args.show:
-        # この show は「ノートブック内から import して呼ぶ」場合に有効
         img_path = out_dir / f"{stem}_triptych.png"
         try:
             from IPython.display import Image, display
             display(Image(filename=str(img_path)))
         except Exception:
-            # 環境に IPython が無い場合は無視
             pass
 
 
