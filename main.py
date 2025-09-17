@@ -1,10 +1,10 @@
 # ============================================
 # main.py — PyTorch-DeepFloorplan
-#   newyork/{train,test} + r3d_{train,test}.txt 構成に対応
-#   画像/マスクを Dataset 内で 512x512 にリサイズ（可変: --input_size）
-#   マスクは必ず 1ch(2D) に統一（RGBマスクも安全に処理）
-#   Conv2d に uint8 が入って落ちる問題は model(im) 直前の prepare_inputs() で根絶
-#   AMP は CUDA 環境でのみ自動使用（バージョン差も吸収）
+#   ・newyork/{train,test} + r3d_{train,test}.txt 構成に対応
+#   ・画像/マスクを Dataset 内で 512x512 にリサイズ（--input_size で変更可）
+#   ・マスクはデフォルトで 0/1 に二値化（--no_bin で無効化）
+#   ・uint8→float正規化＆ImageNet正規化を統一
+#   ・AMP は CUDA 環境でのみ自動使用（torch バージョン差を吸収）
 # ============================================
 
 import os
@@ -110,7 +110,7 @@ def _scan_triplets(bases: List[Path], rooms_suffix: str, wall_suffix: str) -> Di
     return triplets
 
 # --------------------------------------------
-# Dataset（train/test サブフォルダ & r3d_*.txt 対応 + リサイズ/1ch化）
+# Dataset（train/test サブフォルダ & r3d_*.txt 対応 + リサイズ/1ch化/二値化）
 # --------------------------------------------
 class NYRoomWallDataset(Dataset):
     """
@@ -123,21 +123,23 @@ class NYRoomWallDataset(Dataset):
       画像: <ID>.jpg|png
       部屋: <ID>_rooms.png  （rooms_suffix）
       壁:   <ID>_wall.png   （wall_suffix）
-    __getitem__ 内で (W,H) = (input_size, input_size) に**リサイズ**し、
-    マスクは必ず 1ch(2D) に統一します。
+    __getitem__ で (W,H) = (input_size, input_size) に**リサイズ**し、
+    マスクは 1ch(2D) に統一し、既定では **0/1 の二値化**を行います。
     返却タプル: (im, cw, r, meta)  ※cw=wall, r=rooms（元コード互換）
     """
-    _warned_color_mask_once = False  # 3chマスクを見つけたら1回だけ警告
+    _warned_color_mask_once = False  # 3chマスク検出時の一度きり警告
 
     def __init__(self, data_root: Path, split: str,
                  rooms_suffix: str = "_rooms.png",
                  wall_suffix: str = "_wall.png",
                  explicit_ids: Optional[List[str]] = None,
-                 input_size: int = 512):
+                 input_size: int = 512,
+                 binarize: bool = True):
         from PIL import Image
         self.Image = Image
         self.root = Path(data_root)
         self.input_size = int(input_size)
+        self.binarize = bool(binarize)
         if not self.root.exists():
             raise FileNotFoundError(f"data_root not found: {self.root}")
 
@@ -258,9 +260,16 @@ class NYRoomWallDataset(Dataset):
         rooms_np = self._to_single_channel(rooms_np, rec["rooms"].name)
         wall_np  = self._to_single_channel(wall_np,  rec["wall"].name)
 
+        # ====== ここが今回のポイント：二値化で範囲外ラベルを根絶 ======
+        if self.binarize:
+            # 非ゼロを前景(1)、ゼロを背景(0)
+            rooms_np = (rooms_np > 0).astype(np.uint8)
+            wall_np  = (wall_np  > 0).astype(np.uint8)
+        # ============================================================
+
         im_t = torch.from_numpy(img_np).permute(2, 0, 1).contiguous()   # uint8 (3,H,W)
-        cw_t = torch.from_numpy(wall_np.astype(np.int64))               # cw = wall (H,W)
-        r_t  = torch.from_numpy(rooms_np.astype(np.int64))              # r  = rooms (H,W)
+        cw_t = torch.from_numpy(wall_np.astype(np.int64))               # cw = wall (H,W) 0/1
+        r_t  = torch.from_numpy(rooms_np.astype(np.int64))              # r  = rooms (H,W) 0/1
 
         meta = {"name": rec["name"], "im_path": str(rec["img"])}
         return im_t, cw_t, r_t, meta
@@ -275,12 +284,14 @@ def build_dataloaders(args) -> Tuple[DataLoader, DataLoader]:
                                  rooms_suffix=args.rooms_suffix,
                                  wall_suffix=args.wall_suffix,
                                  explicit_ids=train_ids,
-                                 input_size=args.input_size)
+                                 input_size=args.input_size,
+                                 binarize=not args.no_bin)
     val_ds   = NYRoomWallDataset(root, split="test" if args.use_test_as_val else "val",
                                  rooms_suffix=args.rooms_suffix,
                                  wall_suffix=args.wall_suffix,
                                  explicit_ids=val_ids,
-                                 input_size=args.input_size)
+                                 input_size=args.input_size,
+                                 binarize=not args.no_bin)
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
@@ -295,14 +306,18 @@ def build_dataloaders(args) -> Tuple[DataLoader, DataLoader]:
 # --------------------------------------------
 # モデル
 # --------------------------------------------
-from net import DFPmodel  # ← 新API対応 net.py を使用
+from net import DFPmodel  # ← net.py は既に修正済みのものを使用
 
 # --------------------------------------------
 # ロス・メトリクス
 # --------------------------------------------
+def _make_ce(ignore_index: int = -100):
+    # ignore_index は将来の拡張用（現状は未使用）。安全のため設定可能に。
+    return nn.CrossEntropyLoss(ignore_index=ignore_index)
+
 def compute_losses(logits_r, logits_cw, r_gt, cw_gt, w_r=1.0, w_cw=1.0):
-    ce_r  = nn.CrossEntropyLoss()
-    ce_cw = nn.CrossEntropyLoss()
+    ce_r  = _make_ce()
+    ce_cw = _make_ce()
     loss_r  = ce_r(logits_r,  r_gt.long())
     loss_cw = ce_cw(logits_cw, cw_gt.long())
     loss = w_r * loss_r + w_cw * loss_cw
@@ -328,7 +343,6 @@ def train_one_epoch(model, loader, optimizer, scaler, device, args):
 
         optimizer.zero_grad(set_to_none=True)
         if args.amp and device.type == "cuda":
-            # 互換性の高い autocast（cuda 環境のみ）
             from torch.cuda.amp import autocast
             with autocast(dtype=torch.float16):
                 logits_r, logits_cw = model(im)
@@ -482,6 +496,10 @@ def build_argparser():
     p.add_argument("--log_interval", type=int, default=50)
     p.add_argument("--inference_dir", type=str, default="./inference_samples")
     p.add_argument("--inference_limit", type=int, default=10)
+
+    # ★ 追加：二値化のON/OFF（デフォルトON）
+    p.add_argument("--no_bin", action="store_true",
+                   help="マスク二値化を無効化（既定は二値化ON）")
     return p
 
 # --------------------------------------------
