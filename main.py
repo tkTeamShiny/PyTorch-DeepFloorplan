@@ -1,17 +1,10 @@
 # ============================================
 # main.py — PyTorch-DeepFloorplan
-#   対応構成:
-#     ./dataset/newyork/
-#       ├── train/  … <ID>.jpg|png, <ID>_rooms.png, <ID>_wall.png
-#       ├── test/   … 同上
-#       ├── r3d_train.txt   （任意・優先利用）
-#       └── r3d_test.txt    （任意・優先利用）
-#   仕様:
-#     - r3d_*.txt があれば分割に優先使用（無ければ 80/20）。
-#     - 画像/マスクは Dataset 内で共通サイズにリサイズ（既定 512x512）。
-#     - Conv2d に uint8 が入って落ちる問題は model(im) 直前の prepare_inputs() で根絶。
-#     - AMP は torch のバージョン差を吸収（cuda なら autocast+GradScaler、CPU/非AMPは通常実行）。
-#     - VGG16 の weights は net.py 側で torchvision 新API (VGG16_Weights.DEFAULT) を使用。
+#   newyork/{train,test} + r3d_{train,test}.txt 構成に対応
+#   画像/マスクを Dataset 内で 512x512 にリサイズ（可変: --input_size）
+#   マスクは必ず 1ch(2D) に統一（RGBマスクも安全に処理）
+#   Conv2d に uint8 が入って落ちる問題は model(im) 直前の prepare_inputs() で根絶
+#   AMP は CUDA 環境でのみ自動使用（バージョン差も吸収）
 # ============================================
 
 import os
@@ -117,7 +110,7 @@ def _scan_triplets(bases: List[Path], rooms_suffix: str, wall_suffix: str) -> Di
     return triplets
 
 # --------------------------------------------
-# Dataset（train/test サブフォルダ & r3d_*.txt 対応 + リサイズ）
+# Dataset（train/test サブフォルダ & r3d_*.txt 対応 + リサイズ/1ch化）
 # --------------------------------------------
 class NYRoomWallDataset(Dataset):
     """
@@ -130,9 +123,12 @@ class NYRoomWallDataset(Dataset):
       画像: <ID>.jpg|png
       部屋: <ID>_rooms.png  （rooms_suffix）
       壁:   <ID>_wall.png   （wall_suffix）
-    __getitem__ 内で (W,H) = (input_size, input_size) に**リサイズ**。
+    __getitem__ 内で (W,H) = (input_size, input_size) に**リサイズ**し、
+    マスクは必ず 1ch(2D) に統一します。
     返却タプル: (im, cw, r, meta)  ※cw=wall, r=rooms（元コード互換）
     """
+    _warned_color_mask_once = False  # 3chマスクを見つけたら1回だけ警告
+
     def __init__(self, data_root: Path, split: str,
                  rooms_suffix: str = "_rooms.png",
                  wall_suffix: str = "_wall.png",
@@ -209,6 +205,27 @@ class NYRoomWallDataset(Dataset):
 
         print(f"[data] base={[str(b) for b in bases]}  split={split:5s}  samples={len(self.samples)}")
 
+    @staticmethod
+    def _to_single_channel(arr: np.ndarray, name: str) -> np.ndarray:
+        """
+        入力: arr (H,W) or (H,W,3)
+        出力: (H,W) への安全な変換
+        - 3ch かつ R=G=B の場合 → その1chを採用
+        - 3ch でチャネルが異なる場合 → 先頭チャネルを採用（1回だけ警告）
+        """
+        if arr.ndim == 2:
+            return arr
+        if arr.ndim == 3 and arr.shape[2] == 3:
+            if np.all(arr[..., 0] == arr[..., 1]) and np.all(arr[..., 0] == arr[..., 2]):
+                return arr[..., 0]
+            else:
+                if not NYRoomWallDataset._warned_color_mask_once:
+                    print(f"[warn] color mask detected on '{name}'. Using channel-0 as labels. "
+                          f"(Ensure your masks are index images to avoid label drift.)")
+                    NYRoomWallDataset._warned_color_mask_once = True
+                return arr[..., 0]
+        raise ValueError(f"Unexpected mask shape for '{name}': {arr.shape}")
+
     def __len__(self):
         return len(self.samples)
 
@@ -219,9 +236,13 @@ class NYRoomWallDataset(Dataset):
         img = self.Image.open(rec["img"])
         if img.mode != "RGB":
             img = img.convert("RGB")
-        # マスク（8bitクラスID）
+        # マスク（8bitクラスID）。P/L以外（RGB等）は L に変換して2D化を優先
         rooms_img = self.Image.open(rec["rooms"])
+        if rooms_img.mode not in ("L", "P"):
+            rooms_img = rooms_img.convert("L")
         wall_img  = self.Image.open(rec["wall"])
+        if wall_img.mode not in ("L", "P"):
+            wall_img = wall_img.convert("L")
 
         # ---- 固定解像度へリサイズ（画像=双線形 / マスク=最近傍）----
         size = (self.input_size, self.input_size)
@@ -229,13 +250,17 @@ class NYRoomWallDataset(Dataset):
         rooms_img = rooms_img.resize(size, self.Image.NEAREST)
         wall_img  = wall_img.resize(size,  self.Image.NEAREST)
 
-        img = np.array(img, dtype=np.uint8)            # (H,W,3)
-        rooms = np.array(rooms_img, dtype=np.uint8)    # (H,W)
-        wall  = np.array(wall_img,  dtype=np.uint8)    # (H,W)
+        img_np   = np.array(img,        dtype=np.uint8)  # (H,W,3)
+        rooms_np = np.array(rooms_img,  dtype=np.uint8)  # (H,W) or (H,W,3)
+        wall_np  = np.array(wall_img,   dtype=np.uint8)  # (H,W) or (H,W,3)
 
-        im_t = torch.from_numpy(img).permute(2, 0, 1).contiguous()  # uint8 (3,H,W)
-        cw_t = torch.from_numpy(wall.astype(np.int64))              # cw = wall
-        r_t  = torch.from_numpy(rooms.astype(np.int64))             # r  = rooms
+        # 必ず 2D 化
+        rooms_np = self._to_single_channel(rooms_np, rec["rooms"].name)
+        wall_np  = self._to_single_channel(wall_np,  rec["wall"].name)
+
+        im_t = torch.from_numpy(img_np).permute(2, 0, 1).contiguous()   # uint8 (3,H,W)
+        cw_t = torch.from_numpy(wall_np.astype(np.int64))               # cw = wall (H,W)
+        r_t  = torch.from_numpy(rooms_np.astype(np.int64))              # r  = rooms (H,W)
 
         meta = {"name": rec["name"], "im_path": str(rec["img"])}
         return im_t, cw_t, r_t, meta
